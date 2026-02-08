@@ -3,7 +3,7 @@ pipeline {
 
   environment {
     COMPOSE_DIR = "infra/compose"
-    API_BASE = "http://host.docker.internal:8000"
+    API_BASE    = "http://host.docker.internal:8000"
   }
 
   options {
@@ -12,29 +12,31 @@ pipeline {
   }
 
   stages {
-    stage("Workspace ready") {
+
+    stage("Checkout ok") {
       steps {
-        echo "Workspace ready"
         sh 'pwd && ls -la'
       }
     }
 
-    stage("Create .env for compose") {
+    stage("Create .env at repo root") {
       steps {
         withCredentials([
-          string(credentialsId: 'CHURN_API_KEY', variable: 'API_KEY'),
+          string(credentialsId: 'CHURN_API_KEY',      variable: 'API_KEY'),
 
-          string(credentialsId: 'POSTGRES_DB', variable: 'POSTGRES_DB'),
-          string(credentialsId: 'POSTGRES_USER', variable: 'POSTGRES_USER'),
-          string(credentialsId: 'POSTGRES_PASSWORD', variable: 'POSTGRES_PASSWORD'),
+          string(credentialsId: 'POSTGRES_DB',        variable: 'POSTGRES_DB'),
+          string(credentialsId: 'POSTGRES_USER',      variable: 'POSTGRES_USER'),
+          string(credentialsId: 'POSTGRES_PASSWORD',  variable: 'POSTGRES_PASSWORD'),
 
-          string(credentialsId: 'MINIO_ROOT_USER', variable: 'MINIO_ROOT_USER'),
+          string(credentialsId: 'MINIO_ROOT_USER',     variable: 'MINIO_ROOT_USER'),
           string(credentialsId: 'MINIO_ROOT_PASSWORD', variable: 'MINIO_ROOT_PASSWORD'),
-          string(credentialsId: 'MINIO_BUCKET', variable: 'MINIO_BUCKET')
+          string(credentialsId: 'MINIO_BUCKET',        variable: 'MINIO_BUCKET')
         ]) {
           sh '''
             set -e
-            # .env MUST be at repo root because compose uses env_file: ../../.env from infra/compose
+
+            # IMPORTANT: compose env_file is infra/compose -> ../../.env
+            # so .env must live at repo root (workspace root)
             cat > .env << EOF
 API_KEY=${API_KEY}
 POSTGRES_DB=${POSTGRES_DB}
@@ -46,40 +48,50 @@ MINIO_BUCKET=${MINIO_BUCKET}
 MINIO_ENDPOINT=http://minio:9000
 EOF
 
-            echo ".env created."
-            # Quick sanity (no secrets printed)
+            echo ".env created at: $(pwd)/.env"
             ls -la .env
+
+            # non-secret sanity (no passwords)
             grep -E "^(POSTGRES_DB|POSTGRES_USER|MINIO_ROOT_USER|MINIO_BUCKET|MINIO_ENDPOINT)=" .env || true
           '''
         }
       }
     }
 
-    stage("Bring stack up (stable)") {
+    stage("Bring stack up (stable CI)") {
       steps {
         sh """
           set -e
+
           cd ${COMPOSE_DIR}
 
-          # Verify compose can see env_file
+          # Make sure compose can see env_file ../../.env
           test -f ../../.env
 
-          # Start core deps first
+          # Start deps first (no race)
           docker compose up -d postgres minio
 
-          # Wait postgres healthy (up to ~60s)
-          for i in \$(seq 1 30); do
+          # Wait for postgres healthy
+          echo "Waiting postgres healthy..."
+          for i in \$(seq 1 40); do
             docker compose ps postgres | grep -qi healthy && break || true
             sleep 2
           done
 
-          # Run minio_init (one-shot). If it flakes, don't kill the build.
+          # Wait for minio to accept connections (simple HTTP check)
+          echo "Waiting minio ready..."
+          for i in \$(seq 1 40); do
+            curl -sSf http://localhost:9000/minio/health/ready >/dev/null 2>&1 && break || true
+            sleep 2
+          done
+
+          # Run minio_init as one-shot (DON'T let it block forever)
+          echo "Running minio_init..."
           docker compose up -d minio_init || true
 
-          # Start app services
+          # Start api + ui
           docker compose up -d api ui
 
-          # Show status
           docker compose ps
         """
       }
@@ -161,8 +173,15 @@ EOF
   post {
     always {
       echo "Pipeline finished."
-      // Optional: show compose logs on failure
-      // sh "cd ${COMPOSE_DIR} && docker compose logs --tail=120 || true"
+    }
+    failure {
+      echo "Pipeline failed; showing compose status/logs..."
+      sh """
+        set +e
+        cd ${COMPOSE_DIR}
+        docker compose ps || true
+        docker compose logs --tail=120 minio minio_init postgres api ui || true
+      """
     }
   }
 }
