@@ -3,7 +3,9 @@ pipeline {
 
   environment {
     COMPOSE_DIR = "infra/compose"
+    // Jenkins container içinden host üzerindeki API’ye erişim:
     API_BASE    = "http://host.docker.internal:8000"
+    ENV_FILE    = "../../.env"
   }
 
   options {
@@ -22,11 +24,11 @@ pipeline {
     stage("Create .env at repo root") {
       steps {
         withCredentials([
-          string(credentialsId: 'CHURN_API_KEY',      variable: 'API_KEY'),
+          string(credentialsId: 'CHURN_API_KEY',       variable: 'API_KEY'),
 
-          string(credentialsId: 'POSTGRES_DB',        variable: 'POSTGRES_DB'),
-          string(credentialsId: 'POSTGRES_USER',      variable: 'POSTGRES_USER'),
-          string(credentialsId: 'POSTGRES_PASSWORD',  variable: 'POSTGRES_PASSWORD'),
+          string(credentialsId: 'POSTGRES_DB',         variable: 'POSTGRES_DB'),
+          string(credentialsId: 'POSTGRES_USER',       variable: 'POSTGRES_USER'),
+          string(credentialsId: 'POSTGRES_PASSWORD',   variable: 'POSTGRES_PASSWORD'),
 
           string(credentialsId: 'MINIO_ROOT_USER',     variable: 'MINIO_ROOT_USER'),
           string(credentialsId: 'MINIO_ROOT_PASSWORD', variable: 'MINIO_ROOT_PASSWORD'),
@@ -35,8 +37,7 @@ pipeline {
           sh '''
             set -e
 
-            # IMPORTANT: compose env_file is infra/compose -> ../../.env
-            # so .env must live at repo root (workspace root)
+            # .env must live at repo root (workspace root)
             cat > .env << EOF
 API_KEY=${API_KEY}
 POSTGRES_DB=${POSTGRES_DB}
@@ -50,8 +51,6 @@ EOF
 
             echo ".env created at: $(pwd)/.env"
             ls -la .env
-
-            # non-secret sanity (no passwords)
             grep -E "^(POSTGRES_DB|POSTGRES_USER|MINIO_ROOT_USER|MINIO_BUCKET|MINIO_ENDPOINT)=" .env || true
           '''
         }
@@ -62,37 +61,47 @@ EOF
       steps {
         sh """
           set -e
-
           cd ${COMPOSE_DIR}
 
-          # Make sure compose can see env_file ../../.env
-          test -f ../../.env
+          # Compose MUST read repo-root .env
+          test -f ${ENV_FILE}
 
-          # Start deps first (no race)
-          docker compose up -d postgres minio
+          # Start deps first (avoid race)
+          docker compose --env-file ${ENV_FILE} up -d postgres minio
 
-          # Wait for postgres healthy
+          # Wait postgres healthy
           echo "Waiting postgres healthy..."
-          for i in \$(seq 1 40); do
-            docker compose ps postgres | grep -qi healthy && break || true
+          for i in \$(seq 1 60); do
+            docker compose --env-file ${ENV_FILE} ps postgres | grep -qi healthy && break || true
             sleep 2
           done
+          docker compose --env-file ${ENV_FILE} ps postgres | grep -qi healthy
 
-          # Wait for minio to accept connections (simple HTTP check)
+          # Wait minio ready (IMPORTANT: use service name, not localhost)
           echo "Waiting minio ready..."
-          for i in \$(seq 1 40); do
-            curl -sSf http://localhost:9000/minio/health/ready >/dev/null 2>&1 && break || true
+          for i in \$(seq 1 60); do
+            curl -sSf http://minio:9000/minio/health/ready >/dev/null 2>&1 && break || true
+            sleep 2
+          done
+          curl -sSf http://minio:9000/minio/health/ready >/dev/null
+
+          # Run minio_init as one-shot (don't let it hang)
+          echo "Running minio_init..."
+          docker compose --env-file ${ENV_FILE} up -d minio_init || true
+
+          # Wait minio_init to exit (max 60s)
+          echo "Waiting minio_init to finish..."
+          for i in \$(seq 1 30); do
+            state=\$(docker compose --env-file ${ENV_FILE} ps -a minio_init --format json 2>/dev/null | tail -n 1 | tr -d '\\n' || true)
+            # fallback: old compose may not support --format json, so use plain grep
+            docker compose --env-file ${ENV_FILE} ps -a minio_init | grep -Eqi '(Exit 0|exited \\(0\\))' && break || true
             sleep 2
           done
 
-          # Run minio_init as one-shot (DON'T let it block forever)
-          echo "Running minio_init..."
-          docker compose up -d minio_init || true
+          # Start API + UI
+          docker compose --env-file ${ENV_FILE} up -d api ui
 
-          # Start api + ui
-          docker compose up -d api ui
-
-          docker compose ps
+          docker compose --env-file ${ENV_FILE} ps
         """
       }
     }
@@ -137,7 +146,7 @@ EOF
           sh """
             set -e
             cd ${COMPOSE_DIR}
-            docker compose --profile train run --rm trainer
+            docker compose --env-file ${ENV_FILE} --profile train run --rm trainer
           """
         }
       }
@@ -179,8 +188,8 @@ EOF
       sh """
         set +e
         cd ${COMPOSE_DIR}
-        docker compose ps || true
-        docker compose logs --tail=120 minio minio_init postgres api ui || true
+        docker compose --env-file ${ENV_FILE} ps || true
+        docker compose --env-file ${ENV_FILE} logs --tail=200 minio minio_init postgres api ui || true
       """
     }
   }
