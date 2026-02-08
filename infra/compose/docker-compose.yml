@@ -107,6 +107,14 @@ services:
     ports:
       - "8080:8080"
       - "50000:50000"
+
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
+
     volumes:
       - jenkins_home:/var/jenkins_home
       # Docker CLI inside Jenkins container
@@ -114,6 +122,8 @@ services:
       # Docker binary (hostta varsa) - Rocky’de genelde /usr/bin/docker
       - /usr/bin/docker:/usr/bin/docker
       # Docker Compose plugin uses "docker compose" (v2). Eğer hostta docker compose subcommand var ise yeter.
+      - /usr/libexec/docker/cli-plugins/docker-compose:/usr/libexec/docker/cli-plugins/docker-compose
+
     environment:
       JENKINS_OPTS: "--httpPort=8080"
     depends_on:
