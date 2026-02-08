@@ -1,0 +1,127 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: churn_postgres
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  minio:
+    image: minio/minio:latest
+    container_name: churn_minio
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - miniodata:/data
+
+  minio_init:
+    image: minio/mc:latest
+    container_name: churn_minio_init
+    depends_on:
+      - minio
+    env_file:
+      - ../../.env
+    entrypoint: >
+      /bin/sh -lc "
+      echo '⏳ Waiting for MinIO (mc alias)...';
+      until mc alias set local ${MINIO_ENDPOINT} ${MINIO_ROOT_USER} ${MINIO_ROOT_PASSWORD} >/dev/null 2>&1; do
+        sleep 2;
+      done;
+      echo '✅ MinIO reachable';
+
+      mc mb -p local/${MINIO_BUCKET} >/dev/null 2>&1 || true;
+      mc ls local/${MINIO_BUCKET} >/dev/null 2>&1 || true;
+
+      echo '✅ Bucket ready: ${MINIO_BUCKET}';
+      exit 0
+      "
+
+  api:
+    build:
+      context: ../../
+      dockerfile: apps/api/Dockerfile
+    container_name: churn_api
+    env_file:
+      - ../../.env
+    environment:
+      POSTGRES_HOST: postgres
+      MINIO_ENDPOINT: http://minio:9000
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_started
+      minio_init:
+        condition: service_completed_successfully
+
+  ui:
+    build:
+      context: ../../
+      dockerfile: apps/ui/Dockerfile
+    container_name: churn_ui
+    env_file:
+      - ../../.env
+    environment:
+      API_BASE_URL: http://api:8000
+    ports:
+      - "8501:8501"
+    depends_on:
+      - api
+
+  trainer:
+    build:
+      context: ../../
+      dockerfile: apps/trainer/Dockerfile
+    container_name: churn_trainer
+    env_file:
+      - ../../.env
+    environment:
+      MINIO_ENDPOINT: http://minio:9000
+      DATA_PATH: /app/data/raw/telco_churn.csv
+    depends_on:
+      - minio
+      - minio_init
+    profiles: ["train"]
+
+  jenkins:
+    image: jenkins/jenkins:lts-jdk17
+    container_name: churn_jenkins
+    user: root
+    ports:
+      - "8080:8080"
+      - "50000:50000"
+    volumes:
+      - jenkins_home:/var/jenkins_home
+      # Docker CLI inside Jenkins container
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Docker binary (hostta varsa) - Rocky’de genelde /usr/bin/docker
+      - /usr/bin/docker:/usr/bin/docker
+      # Docker Compose plugin uses "docker compose" (v2). Eğer hostta docker compose subcommand var ise yeter.
+    environment:
+      JENKINS_OPTS: "--httpPort=8080"
+    depends_on:
+      - api
+      - ui
+
+
+volumes:
+  pgdata:
+  miniodata:
+  jenkins_home:

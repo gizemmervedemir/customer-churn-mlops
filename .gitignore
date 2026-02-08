@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+.env
+
+# Data (do not commit)
+data/raw/
+data/reference/
+
+# Artifacts / logs
+*.log
+*.joblib
+*.parquet
+*.json
+
+# OS/IDE
+.DS_Store
+.vscode/
