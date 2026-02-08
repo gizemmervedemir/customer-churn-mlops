@@ -3,7 +3,8 @@ pipeline {
 
   environment {
     COMPOSE_DIR = "infra/compose"
-    API_BASE = "http://localhost:8000"
+    // Jenkins container içinden host üzerindeki 8000 portuna erişmek için:
+    API_BASE = "http://host.docker.internal:8000"
   }
 
   options {
@@ -15,6 +16,37 @@ pipeline {
       steps {
         echo "Workspace ready"
         sh "pwd && ls -la"
+      }
+    }
+
+    stage("Create .env for compose") {
+      steps {
+        withCredentials([
+          string(credentialsId: 'CHURN_API_KEY', variable: 'API_KEY'),
+
+          string(credentialsId: 'POSTGRES_DB', variable: 'POSTGRES_DB'),
+          string(credentialsId: 'POSTGRES_USER', variable: 'POSTGRES_USER'),
+          string(credentialsId: 'POSTGRES_PASSWORD', variable: 'POSTGRES_PASSWORD'),
+
+          string(credentialsId: 'MINIO_ROOT_USER', variable: 'MINIO_ROOT_USER'),
+          string(credentialsId: 'MINIO_ROOT_PASSWORD', variable: 'MINIO_ROOT_PASSWORD'),
+          string(credentialsId: 'MINIO_BUCKET', variable: 'MINIO_BUCKET')
+        ]) {
+          sh """
+            set -e
+            cat > .env << EOF
+API_KEY=${API_KEY}
+POSTGRES_DB=${POSTGRES_DB}
+POSTGRES_USER=${POSTGRES_USER}
+POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+MINIO_ROOT_USER=${MINIO_ROOT_USER}
+MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD}
+MINIO_BUCKET=${MINIO_BUCKET}
+MINIO_ENDPOINT=http://minio:9000
+EOF
+            echo ".env created in workspace."
+          """
+        }
       }
     }
 
@@ -35,7 +67,10 @@ pipeline {
         ]) {
           sh """
             set -e
+            echo "--- health ---"
             curl -sS ${API_BASE}/health
+
+            echo "\\n--- schema ---"
             curl -sS ${API_BASE}/predict/schema -H "X-API-Key: ${CHURN_API_KEY}"
           """
         }
@@ -60,8 +95,10 @@ pipeline {
       steps {
         script {
           def out = sh(script: "cat drift.json", returnStdout: true).trim()
+
+          // "Not enough predictions yet" gibi durumlarda drift_detected olmayacak → retrain yok
           if (!out.contains('"drift_detected":true')) {
-            echo "No drift detected. Skipping retrain."
+            echo "No drift detected (or not enough data). Skipping retrain."
             return
           }
 
@@ -112,4 +149,3 @@ pipeline {
     }
   }
 }
-
