@@ -5,7 +5,7 @@ pipeline {
   environment {
     COMPOSE_DIR = "infra/compose"
     // Jenkins container içinden host üzerindeki API’ye erişim:
-    API_BASE    = "http://host.docker.internal:8000"
+    API_BASE    = "http://api:8000"
     ENV_FILE    = "../../.env"
   }
 
@@ -112,6 +112,13 @@ EOF
         withCredentials([string(credentialsId: 'CHURN_API_KEY', variable: 'CHURN_API_KEY')]) {
           sh """
             set -e
+
+            echo "Waiting API to be ready..."
+            for i in $(seq 1 40); do
+              curl -sS http://api:8000/health >/dev/null 2>&1 && break || true
+              sleep 2
+           done
+           
             echo "--- health ---"
             curl -sS ${API_BASE}/health
 
