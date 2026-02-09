@@ -3,9 +3,7 @@ pipeline {
 
   environment {
     COMPOSE_DIR = "infra/compose"
-    // Jenkins container içinden host üzerindeki API’ye erişim:
     API_BASE    = "http://host.docker.internal:8000"
-    ENV_FILE    = "../../.env"
   }
 
   options {
@@ -36,8 +34,6 @@ pipeline {
         ]) {
           sh '''
             set -e
-
-            # .env must live at repo root (workspace root)
             cat > .env << EOF
 API_KEY=${API_KEY}
 POSTGRES_DB=${POSTGRES_DB}
@@ -62,47 +58,42 @@ EOF
         sh """
           set -e
           cd ${COMPOSE_DIR}
+          test -f ../../.env
 
-          # Compose MUST read repo-root .env
-          test -f ${ENV_FILE}
+          docker compose up -d postgres minio
 
-          # Start deps first (avoid race)
-          docker compose --env-file ${ENV_FILE} up -d postgres minio
-
-          # Wait postgres healthy
           echo "Waiting postgres healthy..."
-          for i in \$(seq 1 60); do
-            docker compose --env-file ${ENV_FILE} ps postgres | grep -qi healthy && break || true
+          for i in \$(seq 1 40); do
+            docker compose ps postgres | grep -qi healthy && break || true
             sleep 2
           done
-          docker compose --env-file ${ENV_FILE} ps postgres | grep -qi healthy
 
-          # Wait minio ready (IMPORTANT: use service name, not localhost)
           echo "Waiting minio ready..."
-          for i in \$(seq 1 60); do
-            curl -sSf http://minio:9000/minio/health/ready >/dev/null 2>&1 && break || true
+          for i in \$(seq 1 40); do
+            curl -sSf http://localhost:9000/minio/health/ready >/dev/null 2>&1 && break || true
             sleep 2
           done
-          curl -sSf http://minio:9000/minio/health/ready >/dev/null
 
-          # Run minio_init as one-shot (don't let it hang)
           echo "Running minio_init..."
-          docker compose --env-file ${ENV_FILE} up -d minio_init || true
+          docker compose up -d minio_init || true
 
-          # Wait minio_init to exit (max 60s)
-          echo "Waiting minio_init to finish..."
-          for i in \$(seq 1 30); do
-            state=\$(docker compose --env-file ${ENV_FILE} ps -a minio_init --format json 2>/dev/null | tail -n 1 | tr -d '\\n' || true)
-            # fallback: old compose may not support --format json, so use plain grep
-            docker compose --env-file ${ENV_FILE} ps -a minio_init | grep -Eqi '(Exit 0|exited \\(0\\))' && break || true
-            sleep 2
-          done
+          docker compose up -d api ui
 
-          # Start API + UI
-          docker compose --env-file ${ENV_FILE} up -d api ui
-
-          docker compose --env-file ${ENV_FILE} ps
+          docker compose ps
         """
+      }
+    }
+
+    stage("Snapshot: model version (BEFORE)") {
+      steps {
+        withCredentials([string(credentialsId: 'CHURN_API_KEY', variable: 'CHURN_API_KEY')]) {
+          sh """
+            set -e
+            echo "=== MODEL VERSION (BEFORE) ==="
+            curl -sS ${API_BASE}/predict/schema -H "X-API-Key: ${CHURN_API_KEY}" | \
+              python -c "import sys,json; print(json.load(sys.stdin).get('model_version'))"
+          """
+        }
       }
     }
 
@@ -146,8 +137,12 @@ EOF
           sh """
             set -e
             cd ${COMPOSE_DIR}
-            docker compose --env-file ${ENV_FILE} --profile train run --rm trainer
+            docker compose --profile train run --rm trainer
           """
+
+          // after retrain, show version from latest.json path indirectly (via schema after reload),
+          // but schema won't change until reload. We'll still log "retrain finished".
+          echo "Retrain finished. Next: /model/reload will switch the running API to latest model."
         }
       }
     }
@@ -157,8 +152,22 @@ EOF
         withCredentials([string(credentialsId: 'CHURN_API_KEY', variable: 'CHURN_API_KEY')]) {
           sh """
             set -e
+            echo "=== RELOAD RESPONSE ==="
             curl -sS -X POST ${API_BASE}/model/reload \
-              -H "X-API-Key: ${CHURN_API_KEY}"
+              -H "X-API-Key: ${CHURN_API_KEY}" | tee reload.json
+          """
+        }
+      }
+    }
+
+    stage("Snapshot: model version (AFTER reload)") {
+      steps {
+        withCredentials([string(credentialsId: 'CHURN_API_KEY', variable: 'CHURN_API_KEY')]) {
+          sh """
+            set -e
+            echo "=== MODEL VERSION (AFTER reload) ==="
+            curl -sS ${API_BASE}/predict/schema -H "X-API-Key: ${CHURN_API_KEY}" | \
+              python -c "import sys,json; print(json.load(sys.stdin).get('model_version'))"
           """
         }
       }
@@ -188,8 +197,8 @@ EOF
       sh """
         set +e
         cd ${COMPOSE_DIR}
-        docker compose --env-file ${ENV_FILE} ps || true
-        docker compose --env-file ${ENV_FILE} logs --tail=200 minio minio_init postgres api ui || true
+        docker compose ps || true
+        docker compose logs --tail=120 minio minio_init postgres api ui || true
       """
     }
   }
