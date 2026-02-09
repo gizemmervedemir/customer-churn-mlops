@@ -108,26 +108,28 @@ EOF
     }
 
     stage("Smoke: Health & Schema") {
-      steps {
-        withCredentials([string(credentialsId: 'CHURN_API_KEY', variable: 'CHURN_API_KEY')]) {
-          sh """
-            set -e
+  steps {
+    withCredentials([string(credentialsId: 'CHURN_API_KEY', variable: 'CHURN_API_KEY')]) {
+      sh '''
+        set -e
 
-            echo "Waiting API to be ready..."
-            for i in $(seq 1 40); do
-              curl -sS http://api:8000/health >/dev/null 2>&1 && break || true
-              sleep 2
-           done
-           
-            echo "--- health ---"
-            curl -sS ${API_BASE}/health
+        echo "Waiting API to be ready..."
+        for i in $(seq 1 40); do
+          curl -sS http://api:8000/health >/dev/null 2>&1 && break || true
+          sleep 2
+        done
 
-            echo "\\n--- schema ---"
-            curl -sS ${API_BASE}/predict/schema -H "X-API-Key: ${CHURN_API_KEY}"
-          """
-        }
-      }
+        echo "--- health ---"
+        curl -sS http://api:8000/health
+
+        echo ""
+        echo "--- schema ---"
+        curl -sS http://api:8000/predict/schema -H "X-API-Key: $CHURN_API_KEY"
+      '''
     }
+  }
+}
+
 
     stage("Drift check") {
       steps {
