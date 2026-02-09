@@ -3,7 +3,9 @@ pipeline {
 
   environment {
     COMPOSE_DIR = "infra/compose"
+    // Jenkins container içinden host üzerindeki API’ye erişim:
     API_BASE    = "http://host.docker.internal:8000"
+    ENV_FILE    = "../../.env"
   }
 
   options {
@@ -34,6 +36,8 @@ pipeline {
         ]) {
           sh '''
             set -e
+
+            # .env must live at repo root (workspace root)
             cat > .env << EOF
 API_KEY=${API_KEY}
 POSTGRES_DB=${POSTGRES_DB}
@@ -58,33 +62,50 @@ EOF
         sh """
           set -e
           cd ${COMPOSE_DIR}
-          test -f ../../.env
 
-          docker compose up -d postgres minio
+          # Compose MUST read repo-root .env
+          test -f ${ENV_FILE}
 
+          # Start deps first (avoid race)
+          docker compose --env-file ${ENV_FILE} up -d postgres minio
+
+          # Wait postgres healthy
           echo "Waiting postgres healthy..."
-          for i in \$(seq 1 40); do
-            docker compose ps postgres | grep -qi healthy && break || true
+          for i in \$(seq 1 60); do
+            docker compose --env-file ${ENV_FILE} ps postgres | grep -qi healthy && break || true
             sleep 2
           done
+          docker compose --env-file ${ENV_FILE} ps postgres | grep -qi healthy
 
+          # Wait minio ready (IMPORTANT: use service name, not localhost)
           echo "Waiting minio ready..."
-          for i in \$(seq 1 40); do
-            curl -sSf http://localhost:9000/minio/health/ready >/dev/null 2>&1 && break || true
+          for i in \$(seq 1 60); do
+            curl -sSf http://minio:9000/minio/health/ready >/dev/null 2>&1 && break || true
+            sleep 2
+          done
+          curl -sSf http://minio:9000/minio/health/ready >/dev/null
+
+          # Run minio_init as one-shot (don't let it hang)
+          echo "Running minio_init..."
+          docker compose --env-file ${ENV_FILE} up -d minio_init || true
+
+          # Wait minio_init to exit (max 60s)
+          echo "Waiting minio_init to finish..."
+          for i in \$(seq 1 30); do
+            docker compose --env-file ${ENV_FILE} ps -a minio_init | grep -Eqi '(Exit 0|exited \\(0\\))' && break || true
             sleep 2
           done
 
-          echo "Running minio_init..."
-          docker compose up -d minio_init || true
+          # Start API + UI
+          docker compose --env-file ${ENV_FILE} up -d api ui
 
-          docker compose up -d api ui
-
-          docker compose ps
+          docker compose --env-file ${ENV_FILE} ps
         """
       }
     }
 
-    stage("Snapshot: model version (BEFORE)") {
+    // ✅ NEW: prove current running model version BEFORE anything
+    stage("Proof: Model version (BEFORE)") {
       steps {
         withCredentials([string(credentialsId: 'CHURN_API_KEY', variable: 'CHURN_API_KEY')]) {
           sh """
@@ -119,6 +140,14 @@ EOF
             set -e
             curl -sS "${API_BASE}/drift/check?n=200" \
               -H "X-API-Key: ${CHURN_API_KEY}" | tee drift.json
+
+            echo "\\n=== DRIFT SUMMARY (one-line) ==="
+            python - << 'PY'
+import json
+d=json.load(open("drift.json"))
+s=d.get("summary",{})
+print("drift_detected=", s.get("drift_detected"), "| n_current=", s.get("n_current"), "| drifted_features=", len(s.get("drifted_features",[])))
+PY
           """
         }
       }
@@ -137,12 +166,24 @@ EOF
           sh """
             set -e
             cd ${COMPOSE_DIR}
-            docker compose --profile train run --rm trainer
+            docker compose --env-file ${ENV_FILE} --profile train run --rm trainer
           """
 
-          // after retrain, show version from latest.json path indirectly (via schema after reload),
-          // but schema won't change until reload. We'll still log "retrain finished".
-          echo "Retrain finished. Next: /model/reload will switch the running API to latest model."
+          // ✅ NEW: after retrain, show what's written as latest in MinIO (latest.json)
+          sh """
+            set -e
+            echo "=== LATEST AFTER RETRAIN (from MinIO latest.json) ==="
+
+            # Read required vars from env_file without printing secrets
+            MINIO_ROOT_USER=\$(grep -E '^MINIO_ROOT_USER=' ${ENV_FILE} | cut -d= -f2-)
+            MINIO_ROOT_PASSWORD=\$(grep -E '^MINIO_ROOT_PASSWORD=' ${ENV_FILE} | cut -d= -f2-)
+            MINIO_BUCKET=\$(grep -E '^MINIO_BUCKET=' ${ENV_FILE} | cut -d= -f2-)
+
+            # Pull latest.json via MinIO S3-compatible API (needs no mc)
+            curl -sS -u "\${MINIO_ROOT_USER}:\${MINIO_ROOT_PASSWORD}" \\
+              "http://minio:9000/\${MINIO_BUCKET}/churn_model/latest.json" | \\
+              python -c "import sys,json; print(json.load(sys.stdin).get('model_version'))"
+          """
         }
       }
     }
@@ -160,7 +201,8 @@ EOF
       }
     }
 
-    stage("Snapshot: model version (AFTER reload)") {
+    // ✅ NEW: prove running model switched AFTER reload
+    stage("Proof: Model version (AFTER reload)") {
       steps {
         withCredentials([string(credentialsId: 'CHURN_API_KEY', variable: 'CHURN_API_KEY')]) {
           sh """
@@ -178,10 +220,18 @@ EOF
         withCredentials([string(credentialsId: 'CHURN_API_KEY', variable: 'CHURN_API_KEY')]) {
           sh """
             set -e
+            echo "=== PREDICT (smoke) ==="
             curl -sS -X POST ${API_BASE}/predict \
               -H "Content-Type: application/json" \
               -H "X-API-Key: ${CHURN_API_KEY}" \
-              -d '{"features":{"SeniorCitizen":0,"tenure":10,"MonthlyCharges":80,"TotalCharges":500,"gender":"Female","Partner":"Yes","Dependents":"No","PhoneService":"Yes","MultipleLines":"No","InternetService":"DSL","OnlineSecurity":"No","OnlineBackup":"Yes","DeviceProtection":"No","TechSupport":"No","StreamingTV":"No","StreamingMovies":"No","Contract":"Month-to-month","PaperlessBilling":"Yes","PaymentMethod":"Electronic check"}}'
+              -d '{"features":{"SeniorCitizen":0,"tenure":10,"MonthlyCharges":80,"TotalCharges":500,"gender":"Female","Partner":"Yes","Dependents":"No","PhoneService":"Yes","MultipleLines":"No","InternetService":"DSL","OnlineSecurity":"No","OnlineBackup":"Yes","DeviceProtection":"No","TechSupport":"No","StreamingTV":"No","StreamingMovies":"No","Contract":"Month-to-month","PaperlessBilling":"Yes","PaymentMethod":"Electronic check"}}' | tee predict.json
+
+            echo "\\n=== PREDICT SUMMARY (one-line) ==="
+            python - << 'PY'
+import json
+p=json.load(open("predict.json"))
+print("prediction=", p.get("prediction"), "| prob=", p.get("probability"), "| model_version=", p.get("model_version"))
+PY
           """
         }
       }
@@ -197,8 +247,8 @@ EOF
       sh """
         set +e
         cd ${COMPOSE_DIR}
-        docker compose ps || true
-        docker compose logs --tail=120 minio minio_init postgres api ui || true
+        docker compose --env-file ${ENV_FILE} ps || true
+        docker compose --env-file ${ENV_FILE} logs --tail=200 minio minio_init postgres api ui || true
       """
     }
   }
