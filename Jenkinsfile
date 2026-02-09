@@ -3,7 +3,6 @@ pipeline {
 
   environment {
     COMPOSE_DIR = "infra/compose"
-    // Jenkins container içinden host üzerindeki API’ye erişim:
     API_BASE    = "http://host.docker.internal:8000"
     ENV_FILE    = "../../.env"
   }
@@ -37,7 +36,6 @@ pipeline {
           sh '''
             set -e
 
-            # .env must live at repo root (workspace root)
             cat > .env << EOF
 API_KEY=${API_KEY}
 POSTGRES_DB=${POSTGRES_DB}
@@ -59,61 +57,55 @@ EOF
 
     stage("Bring stack up (stable CI)") {
       steps {
-        sh """
+        sh '''
           set -e
-          cd ${COMPOSE_DIR}
+          cd infra/compose
 
-          # Compose MUST read repo-root .env
-          test -f ${ENV_FILE}
+          test -f ../../.env
 
-          # Start deps first (avoid race)
-          docker compose --env-file ${ENV_FILE} up -d postgres minio
+          docker compose --env-file ../../.env up -d postgres minio
 
-          # Wait postgres healthy
           echo "Waiting postgres healthy..."
-          for i in \$(seq 1 60); do
-            docker compose --env-file ${ENV_FILE} ps postgres | grep -qi healthy && break || true
+          for i in $(seq 1 60); do
+            docker compose --env-file ../../.env ps postgres | grep -qi healthy && break || true
             sleep 2
           done
-          docker compose --env-file ${ENV_FILE} ps postgres | grep -qi healthy
+          docker compose --env-file ../../.env ps postgres | grep -qi healthy
 
-          # Wait minio ready (IMPORTANT: use service name, not localhost)
           echo "Waiting minio ready..."
-          for i in \$(seq 1 60); do
+          for i in $(seq 1 60); do
             curl -sSf http://minio:9000/minio/health/ready >/dev/null 2>&1 && break || true
             sleep 2
           done
           curl -sSf http://minio:9000/minio/health/ready >/dev/null
 
-          # Run minio_init as one-shot (don't let it hang)
           echo "Running minio_init..."
-          docker compose --env-file ${ENV_FILE} up -d minio_init || true
+          docker compose --env-file ../../.env up -d minio_init || true
 
-          # Wait minio_init to exit (max 60s)
           echo "Waiting minio_init to finish..."
-          for i in \$(seq 1 30); do
-            docker compose --env-file ${ENV_FILE} ps -a minio_init | grep -Eqi '(Exit 0|exited \\(0\\))' && break || true
+          for i in $(seq 1 30); do
+            docker compose --env-file ../../.env ps -a minio_init | grep -Eqi '(Exit 0|exited \(0\))' && break || true
             sleep 2
           done
 
-          # Start API + UI
-          docker compose --env-file ${ENV_FILE} up -d api ui
-
-          docker compose --env-file ${ENV_FILE} ps
-        """
+          docker compose --env-file ../../.env up -d api ui
+          docker compose --env-file ../../.env ps
+        '''
       }
     }
 
-    // ✅ NEW: prove current running model version BEFORE anything
     stage("Proof: Model version (BEFORE)") {
       steps {
         withCredentials([string(credentialsId: 'CHURN_API_KEY', variable: 'CHURN_API_KEY')]) {
-          sh """
+          sh '''
             set -e
             echo "=== MODEL VERSION (BEFORE) ==="
-            curl -sS ${API_BASE}/predict/schema -H "X-API-Key: ${CHURN_API_KEY}" | \
-              python -c "import sys,json; print(json.load(sys.stdin).get('model_version'))"
-          """
+            curl -sS "$API_BASE/predict/schema" -H "X-API-Key: $CHURN_API_KEY" | tee schema_before.json >/dev/null
+
+            # Extract model_version without python/jq
+            ver=$(sed -n 's/.*"model_version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' schema_before.json | head -n 1)
+            echo "$ver"
+          '''
         }
       }
     }
@@ -121,14 +113,14 @@ EOF
     stage("Smoke: Health & Schema") {
       steps {
         withCredentials([string(credentialsId: 'CHURN_API_KEY', variable: 'CHURN_API_KEY')]) {
-          sh """
+          sh '''
             set -e
             echo "--- health ---"
-            curl -sS ${API_BASE}/health
+            curl -sS "$API_BASE/health"
 
-            echo "\\n--- schema ---"
-            curl -sS ${API_BASE}/predict/schema -H "X-API-Key: ${CHURN_API_KEY}"
-          """
+            echo "\n--- schema ---"
+            curl -sS "$API_BASE/predict/schema" -H "X-API-Key: $CHURN_API_KEY"
+          '''
         }
       }
     }
@@ -136,19 +128,15 @@ EOF
     stage("Drift check") {
       steps {
         withCredentials([string(credentialsId: 'CHURN_API_KEY', variable: 'CHURN_API_KEY')]) {
-          sh """
+          sh '''
             set -e
-            curl -sS "${API_BASE}/drift/check?n=200" \
-              -H "X-API-Key: ${CHURN_API_KEY}" | tee drift.json
+            curl -sS "$API_BASE/drift/check?n=200" -H "X-API-Key: $CHURN_API_KEY" | tee drift.json
 
-            echo "\\n=== DRIFT SUMMARY (one-line) ==="
-            python - << 'PY'
-import json
-d=json.load(open("drift.json"))
-s=d.get("summary",{})
-print("drift_detected=", s.get("drift_detected"), "| n_current=", s.get("n_current"), "| drifted_features=", len(s.get("drifted_features",[])))
-PY
-          """
+            echo "\n=== DRIFT SUMMARY (one-line) ==="
+            drift=$(sed -n 's/.*"drift_detected"[[:space:]]*:[[:space:]]*\(true\|false\).*/\1/p' drift.json | head -n 1)
+            ncur=$(sed -n 's/.*"n_current"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' drift.json | head -n 1)
+            echo "drift_detected=$drift | n_current=$ncur"
+          '''
         }
       }
     }
@@ -163,27 +151,27 @@ PY
           }
 
           echo "Drift detected → retraining model"
-          sh """
+          sh '''
             set -e
-            cd ${COMPOSE_DIR}
-            docker compose --env-file ${ENV_FILE} --profile train run --rm trainer
-          """
+            cd infra/compose
+            docker compose --env-file ../../.env --profile train run --rm trainer
+          '''
 
-          // ✅ NEW: after retrain, show what's written as latest in MinIO (latest.json)
-          sh """
+          // Proof: show latest.json model_version from MinIO (no python/jq)
+          sh '''
             set -e
             echo "=== LATEST AFTER RETRAIN (from MinIO latest.json) ==="
 
-            # Read required vars from env_file without printing secrets
-            MINIO_ROOT_USER=\$(grep -E '^MINIO_ROOT_USER=' ${ENV_FILE} | cut -d= -f2-)
-            MINIO_ROOT_PASSWORD=\$(grep -E '^MINIO_ROOT_PASSWORD=' ${ENV_FILE} | cut -d= -f2-)
-            MINIO_BUCKET=\$(grep -E '^MINIO_BUCKET=' ${ENV_FILE} | cut -d= -f2-)
+            MINIO_ROOT_USER=$(grep -E '^MINIO_ROOT_USER=' ../../.env | cut -d= -f2-)
+            MINIO_ROOT_PASSWORD=$(grep -E '^MINIO_ROOT_PASSWORD=' ../../.env | cut -d= -f2-)
+            MINIO_BUCKET=$(grep -E '^MINIO_BUCKET=' ../../.env | cut -d= -f2-)
 
-            # Pull latest.json via MinIO S3-compatible API (needs no mc)
-            curl -sS -u "\${MINIO_ROOT_USER}:\${MINIO_ROOT_PASSWORD}" \\
-              "http://minio:9000/\${MINIO_BUCKET}/churn_model/latest.json" | \\
-              python -c "import sys,json; print(json.load(sys.stdin).get('model_version'))"
-          """
+            curl -sS -u "${MINIO_ROOT_USER}:${MINIO_ROOT_PASSWORD}" \
+              "http://minio:9000/${MINIO_BUCKET}/churn_model/latest.json" | tee latest.json >/dev/null
+
+            ver=$(sed -n 's/.*"model_version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' latest.json | head -n 1)
+            echo "$ver"
+          '''
         }
       }
     }
@@ -191,26 +179,25 @@ PY
     stage("Reload model in API") {
       steps {
         withCredentials([string(credentialsId: 'CHURN_API_KEY', variable: 'CHURN_API_KEY')]) {
-          sh """
+          sh '''
             set -e
             echo "=== RELOAD RESPONSE ==="
-            curl -sS -X POST ${API_BASE}/model/reload \
-              -H "X-API-Key: ${CHURN_API_KEY}" | tee reload.json
-          """
+            curl -sS -X POST "$API_BASE/model/reload" -H "X-API-Key: $CHURN_API_KEY" | tee reload.json
+          '''
         }
       }
     }
 
-    // ✅ NEW: prove running model switched AFTER reload
     stage("Proof: Model version (AFTER reload)") {
       steps {
         withCredentials([string(credentialsId: 'CHURN_API_KEY', variable: 'CHURN_API_KEY')]) {
-          sh """
+          sh '''
             set -e
             echo "=== MODEL VERSION (AFTER reload) ==="
-            curl -sS ${API_BASE}/predict/schema -H "X-API-Key: ${CHURN_API_KEY}" | \
-              python -c "import sys,json; print(json.load(sys.stdin).get('model_version'))"
-          """
+            curl -sS "$API_BASE/predict/schema" -H "X-API-Key: $CHURN_API_KEY" | tee schema_after.json >/dev/null
+            ver=$(sed -n 's/.*"model_version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' schema_after.json | head -n 1)
+            echo "$ver"
+          '''
         }
       }
     }
@@ -218,21 +205,19 @@ PY
     stage("Final smoke: Predict") {
       steps {
         withCredentials([string(credentialsId: 'CHURN_API_KEY', variable: 'CHURN_API_KEY')]) {
-          sh """
+          sh '''
             set -e
             echo "=== PREDICT (smoke) ==="
-            curl -sS -X POST ${API_BASE}/predict \
+            curl -sS -X POST "$API_BASE/predict" \
               -H "Content-Type: application/json" \
-              -H "X-API-Key: ${CHURN_API_KEY}" \
+              -H "X-API-Key: $CHURN_API_KEY" \
               -d '{"features":{"SeniorCitizen":0,"tenure":10,"MonthlyCharges":80,"TotalCharges":500,"gender":"Female","Partner":"Yes","Dependents":"No","PhoneService":"Yes","MultipleLines":"No","InternetService":"DSL","OnlineSecurity":"No","OnlineBackup":"Yes","DeviceProtection":"No","TechSupport":"No","StreamingTV":"No","StreamingMovies":"No","Contract":"Month-to-month","PaperlessBilling":"Yes","PaymentMethod":"Electronic check"}}' | tee predict.json
 
-            echo "\\n=== PREDICT SUMMARY (one-line) ==="
-            python - << 'PY'
-import json
-p=json.load(open("predict.json"))
-print("prediction=", p.get("prediction"), "| prob=", p.get("probability"), "| model_version=", p.get("model_version"))
-PY
-          """
+            echo "\n=== PREDICT SUMMARY (one-line) ==="
+            pred=$(sed -n 's/.*"prediction"[[:space:]]*:[[:space:]]*\([0-9]\+\).*/\1/p' predict.json | head -n 1)
+            mver=$(sed -n 's/.*"model_version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' predict.json | head -n 1)
+            echo "prediction=$pred | model_version=$mver"
+          '''
         }
       }
     }
@@ -244,12 +229,12 @@ PY
     }
     failure {
       echo "Pipeline failed; showing compose status/logs..."
-      sh """
+      sh '''
         set +e
-        cd ${COMPOSE_DIR}
-        docker compose --env-file ${ENV_FILE} ps || true
-        docker compose --env-file ${ENV_FILE} logs --tail=200 minio minio_init postgres api ui || true
-      """
+        cd infra/compose
+        docker compose --env-file ../../.env ps || true
+        docker compose --env-file ../../.env logs --tail=200 minio minio_init postgres api ui || true
+      '''
     }
   }
 }
