@@ -3,6 +3,7 @@ pipeline {
 
   environment {
     COMPOSE_DIR = "infra/compose"
+    // Jenkins container içinden host üzerindeki API’ye erişim:
     API_BASE    = "http://host.docker.internal:8000"
     ENV_FILE    = "../../.env"
   }
@@ -63,8 +64,10 @@ EOF
 
           test -f ../../.env
 
+          # deps first
           docker compose --env-file ../../.env up -d postgres minio
 
+          # wait postgres healthy
           echo "Waiting postgres healthy..."
           for i in $(seq 1 60); do
             docker compose --env-file ../../.env ps postgres | grep -qi healthy && break || true
@@ -72,6 +75,7 @@ EOF
           done
           docker compose --env-file ../../.env ps postgres | grep -qi healthy
 
+          # wait minio ready (service name)
           echo "Waiting minio ready..."
           for i in $(seq 1 60); do
             curl -sSf http://minio:9000/minio/health/ready >/dev/null 2>&1 && break || true
@@ -79,12 +83,13 @@ EOF
           done
           curl -sSf http://minio:9000/minio/health/ready >/dev/null
 
+          # one-shot init
           echo "Running minio_init..."
           docker compose --env-file ../../.env up -d minio_init || true
 
           echo "Waiting minio_init to finish..."
           for i in $(seq 1 30); do
-            docker compose --env-file ../../.env ps -a minio_init | grep -Eqi '(Exit 0|exited \(0\))' && break || true
+            docker compose --env-file ../../.env ps -a minio_init | grep -Eqi 'Exit 0|exited [(]0[)]' && break || true
             sleep 2
           done
 
@@ -101,8 +106,6 @@ EOF
             set -e
             echo "=== MODEL VERSION (BEFORE) ==="
             curl -sS "$API_BASE/predict/schema" -H "X-API-Key: $CHURN_API_KEY" | tee schema_before.json >/dev/null
-
-            # Extract model_version without python/jq
             ver=$(sed -n 's/.*"model_version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' schema_before.json | head -n 1)
             echo "$ver"
           '''
@@ -118,7 +121,8 @@ EOF
             echo "--- health ---"
             curl -sS "$API_BASE/health"
 
-            echo "\n--- schema ---"
+            echo ""
+            echo "--- schema ---"
             curl -sS "$API_BASE/predict/schema" -H "X-API-Key: $CHURN_API_KEY"
           '''
         }
@@ -132,9 +136,10 @@ EOF
             set -e
             curl -sS "$API_BASE/drift/check?n=200" -H "X-API-Key: $CHURN_API_KEY" | tee drift.json
 
-            echo "\n=== DRIFT SUMMARY (one-line) ==="
-            drift=$(sed -n 's/.*"drift_detected"[[:space:]]*:[[:space:]]*\(true\|false\).*/\1/p' drift.json | head -n 1)
-            ncur=$(sed -n 's/.*"n_current"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' drift.json | head -n 1)
+            echo ""
+            echo "=== DRIFT SUMMARY (one-line) ==="
+            drift=$(sed -n 's/.*"drift_detected"[[:space:]]*:[[:space:]]*\\(true\\|false\\).*/\\1/p' drift.json | head -n 1)
+            ncur=$(sed -n 's/.*"n_current"[[:space:]]*:[[:space:]]*\\([0-9][0-9]*\\).*/\\1/p' drift.json | head -n 1)
             echo "drift_detected=$drift | n_current=$ncur"
           '''
         }
@@ -157,7 +162,7 @@ EOF
             docker compose --env-file ../../.env --profile train run --rm trainer
           '''
 
-          // Proof: show latest.json model_version from MinIO (no python/jq)
+          // (Opsiyonel) MinIO latest.json version kanıtı
           sh '''
             set -e
             echo "=== LATEST AFTER RETRAIN (from MinIO latest.json) ==="
@@ -213,8 +218,9 @@ EOF
               -H "X-API-Key: $CHURN_API_KEY" \
               -d '{"features":{"SeniorCitizen":0,"tenure":10,"MonthlyCharges":80,"TotalCharges":500,"gender":"Female","Partner":"Yes","Dependents":"No","PhoneService":"Yes","MultipleLines":"No","InternetService":"DSL","OnlineSecurity":"No","OnlineBackup":"Yes","DeviceProtection":"No","TechSupport":"No","StreamingTV":"No","StreamingMovies":"No","Contract":"Month-to-month","PaperlessBilling":"Yes","PaymentMethod":"Electronic check"}}' | tee predict.json
 
-            echo "\n=== PREDICT SUMMARY (one-line) ==="
-            pred=$(sed -n 's/.*"prediction"[[:space:]]*:[[:space:]]*\([0-9]\+\).*/\1/p' predict.json | head -n 1)
+            echo ""
+            echo "=== PREDICT SUMMARY (one-line) ==="
+            pred=$(sed -n 's/.*"prediction"[[:space:]]*:[[:space:]]*\\([0-9][0-9]*\\).*/\\1/p' predict.json | head -n 1)
             mver=$(sed -n 's/.*"model_version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' predict.json | head -n 1)
             echo "prediction=$pred | model_version=$mver"
           '''
